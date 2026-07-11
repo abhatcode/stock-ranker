@@ -129,4 +129,4 @@ Listed in the model's predicted order, best first. Each line shows the predicted
  52. AVGO   predicted -0.0203, actual   -8.97%, actual rank 43 of 52
  53. SSNLF  predicted -0.0985, actual   +0.00%, actual rank 30 of 52
 
-Generated 2026-07-03 from validation_results_20260608.csv. Re-run validate_predictions.py to refresh.
+Generated 2026-07-03 from validation_results_20260608.csv.
