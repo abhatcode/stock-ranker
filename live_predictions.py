@@ -1,98 +1,61 @@
+"""Rank the universe today with the trained v2 model.
+
+Output score is the predicted percentile (0..1) of each stock's
+market-excess return over the next HORIZON_DAYS trading days.
+"""
 import pandas as pd
-import numpy as np
-import yfinance as yf
 import xgboost as xgb
+import yfinance as yf
 from datetime import datetime, timedelta
-from config import STOCKS, LOOKBACK_DAYS
-from feature_engineering import calculate_features
 
-try:
-    # Load saved model
-    print("Loading trained model...")
-    booster = xgb.Booster()
-    booster.load_model('trained_model.json')
-    print("✓ Model loaded\n")
+from config import STOCKS, BENCHMARK, HORIZON_DAYS, HISTORY_DAYS, MODEL_VERSION
+from feature_engineering import FEATURE_COLS, build_panel, cross_sectional_normalize
 
-    # Fetch TODAY'S data for all stocks
-    print("Fetching latest data...")
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=730)
+print("Loading trained model...")
+booster = xgb.Booster()
+booster.load_model('trained_model.json')
 
-    data = {}
-    for stock in STOCKS + ['SPY']:
-        try:
-            df = yf.download(stock, start=start_date, end=end_date, progress=False)
-            if len(df) > 0:
-                data[stock] = df
-                print(f"  ✓ {stock}")
-        except Exception as e:
-            print(f"  ✗ {stock}: {str(e)[:30]}")
+print("Fetching latest data...")
+end_date = datetime.now()
+# mom_12m_ex1m needs 252 trading days of history, so fetch ~2 years
+start_date = end_date - timedelta(days=min(HISTORY_DAYS, 730))
 
-    print(f"\n✓ Fetched {len(data)} stocks\n")
+raw = yf.download(STOCKS + [BENCHMARK], start=start_date, end=end_date,
+                  progress=False, auto_adjust=True, group_by='ticker')
 
-    spy_data = data.pop('SPY', None)
+data = {}
+for stock in STOCKS:
+    try:
+        df = raw[stock].dropna(how='all')
+        if len(df) > 300:
+            data[stock] = df
+    except KeyError:
+        pass
+spy_data = raw[BENCHMARK].dropna(how='all')
+print(f"Usable tickers: {len(data)} / {len(STOCKS)}")
 
-    # Calculate features for each stock
-    print("Calculating features...")
-    today_features = []
-    for stock in data.keys():
-        try:
-            df = data[stock]
-            features_df = calculate_features(df, stock, spy_data)
-            if len(features_df) > 0:
-                today_row = features_df.iloc[-1:].copy()  # Get last row (today)
-                today_features.append(today_row)
-        except Exception as e:
-            print(f"  Error with {stock}: {str(e)[:50]}")
+panel = build_panel(data, spy_data, with_target=False)
+panel = cross_sectional_normalize(panel)
 
-    print(f"✓ Calculated features for {len(today_features)} stocks\n")
+latest_date = panel['Date'].max()
+today = panel[panel['Date'] == latest_date].copy()
+print(f"Scoring {len(today)} stocks as of {pd.to_datetime(latest_date).date()}")
 
-    # Combine all today's features
-    all_today = pd.concat(today_features, ignore_index=True)
-    print(f"✓ Combined data shape: {all_today.shape}\n")
+today['score'] = booster.predict(xgb.DMatrix(today[FEATURE_COLS]))
+results = (today[['stock', 'score']]
+           .sort_values('score', ascending=False)
+           .reset_index(drop=True))
+results['rank'] = range(1, len(results) + 1)
 
-    # Prepare features for prediction
-    stock_names = all_today['stock'].values
-    X_today = all_today.drop(['target', 'stock', 'Date'], axis=1, errors='ignore')
-    if 'relative_strength' not in X_today.columns:
-        X_today['relative_strength'] = 0.0
-    print("  Note: relative_strength set to 0 (SPY data not available)")
-    print(f"✓ Features shape: {X_today.shape}\n")
+print("=" * 60)
+print(f"LIVE RANKINGS - {datetime.now():%Y-%m-%d %H:%M:%S}")
+print(f"score = predicted percentile of {HORIZON_DAYS}-trading-day market-excess return")
+print("=" * 60)
+print("\n--- TOP 10 ---\n")
+print(results.head(10)[['rank', 'stock', 'score']].to_string(index=False))
+print("\n--- BOTTOM 10 ---\n")
+print(results.tail(10)[['rank', 'stock', 'score']].to_string(index=False))
 
-    # Create DMatrix for XGBoost (no scaling needed)
-    print("Creating prediction matrix...")
-    dmatrix_today = xgb.DMatrix(X_today)
-    print("✓ Matrix created\n")
-
-    # Make predictions
-    print("Making predictions...")
-    predictions = booster.predict(dmatrix_today)
-    print(f"✓ Predictions made\n")
-
-    # Create results dataframe and rank
-    results = pd.DataFrame({
-        'stock': stock_names,
-        'predicted_return': predictions
-    })
-    results = results.sort_values('predicted_return', ascending=False).reset_index(drop=True)
-    results['rank'] = range(1, len(results) + 1)
-
-    # Print results
-    print("=" * 60)
-    print(f"LIVE PREDICTIONS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-    print("\n--- TOP 10 STOCKS TO BUY ---\n")
-    print(results.head(10)[['rank', 'stock', 'predicted_return']].to_string(index=False))
-    
-    print("\n--- BOTTOM 10 STOCKS TO AVOID ---\n")
-    print(results.tail(10)[['rank', 'stock', 'predicted_return']].to_string(index=False))
-
-    # Save predictions
-    filename = f'predictions_{datetime.now().strftime("%Y%m%d")}.csv'
-    results.to_csv(filename, index=False)
-    print(f"\n✓ Saved to {filename}")
-
-except Exception as e:
-    print(f"\n✗ ERROR: {e}")
-    import traceback
-    traceback.print_exc()
+filename = f'predictions_v{MODEL_VERSION}_{datetime.now():%Y%m%d}.csv'
+results.to_csv(filename, index=False)
+print(f"\nSaved to {filename}")
