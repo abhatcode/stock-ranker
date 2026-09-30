@@ -1,18 +1,11 @@
-"""Feature engineering for the cross-sectional stock ranker (v3).
+"""Builds the model's input features and target from raw price data."""
+import json
 
-Same design principles as v2 (every feature scale-free, z-scored per date,
-rank target on market-excess return) plus:
-- Research-backed anomaly features: short-term reversal, 12-1 momentum,
-  rolling beta, idiosyncratic volatility, return skewness, lottery-effect
-  MAX, Amihud illiquidity, overnight gaps, price-volume correlation.
-- Sector-relative momentum/volatility features and an optional
-  sector-neutral target, so the model ranks stocks against their own
-  category as well as the whole universe.
-"""
 import numpy as np
 import pandas as pd
 
-from config import HORIZON_DAYS, STOCK_SECTOR
+from config import (HORIZON_DAYS, SECTORS, STOCK_SECTOR,
+                    SECTOR_SPECIFIC_FEATURES)
 
 BASE_FEATURES = [
     'ret_3d', 'ret_5d', 'ret_10d', 'ret_21d', 'ret_63d', 'mom_12m_ex1m',
@@ -28,11 +21,14 @@ BASE_FEATURES = [
     'sharpe_21d', 'downside_vol_21d',
 ]
 
-# Cross-sectional (per-date) sector-relative versions, added in build_panel.
 SECTOR_REL_BASE = ['ret_5d', 'ret_21d', 'ret_63d', 'vol_21d']
 SECTOR_REL_FEATURES = [f'sector_rel_{c}' for c in SECTOR_REL_BASE]
 
-FEATURE_COLS = BASE_FEATURES + SECTOR_REL_FEATURES
+SPECIFIC_FEATURES = list(SECTOR_SPECIFIC_FEATURES)
+SECTOR_FLAG_COLS = [f'is_{s}' for s in SECTORS]
+
+NORMALIZED_COLS = BASE_FEATURES + SECTOR_REL_FEATURES + SPECIFIC_FEATURES
+FEATURE_COLS = NORMALIZED_COLS + SECTOR_FLAG_COLS
 
 
 def _flatten(df):
@@ -42,15 +38,19 @@ def _flatten(df):
     return df
 
 
-def calculate_features(df, stock_name, spy_df=None, with_target=True):
-    """Compute scale-free features for one stock. Returns a per-date frame."""
+def calculate_features(df, stock_name, spy_df=None, with_target=True,
+                       macro=None):
+    """Compute scale-free features for one stock. Returns a per-date frame.
+
+    macro: optional {ticker: price frame} for the sector-specific features.
+    """
     df = _flatten(df)
+    sector = STOCK_SECTOR.get(stock_name, 'other')
     close, volume, open_ = df['Close'], df['Volume'], df['Open']
     ret = close.pct_change()
 
     out = pd.DataFrame(index=df.index)
 
-    # Momentum at several horizons + short-term reversal + classic 12-1
     out['ret_3d'] = close.pct_change(3)
     out['ret_5d'] = close.pct_change(5)
     out['ret_10d'] = close.pct_change(10)
@@ -58,7 +58,6 @@ def calculate_features(df, stock_name, spy_df=None, with_target=True):
     out['ret_63d'] = close.pct_change(63)
     out['mom_12m_ex1m'] = close.shift(21) / close.shift(252) - 1
 
-    # Volatility and risk-adjusted momentum
     out['vol_21d'] = ret.rolling(21).std()
     vol_63 = ret.rolling(63).std()
     out['vol_ratio'] = out['vol_21d'] / vol_63
@@ -68,13 +67,11 @@ def calculate_features(df, stock_name, spy_df=None, with_target=True):
     out['skew_63'] = ret.rolling(63).skew()
     out['max_ret_21d'] = ret.rolling(21).max()
 
-    # RSI
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     out['rsi_14'] = 100 - 100 / (1 + gain / loss)
 
-    # Trend, expressed relative to price (never in dollars)
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
     out['price_vs_sma20'] = close / sma20 - 1
@@ -92,7 +89,6 @@ def calculate_features(df, stock_name, spy_df=None, with_target=True):
     out['price_position_63d'] = (close - low63) / (high63 - low63)
     out['dist_from_high_63d'] = close / high63 - 1
 
-    # Volume / liquidity / microstructure
     out['volume_ratio'] = volume / volume.rolling(21).mean()
     out['volume_trend'] = volume.rolling(5).mean() / volume.rolling(63).mean()
     dollar_vol = (close * volume).replace(0, np.nan)
@@ -100,7 +96,6 @@ def calculate_features(df, stock_name, spy_df=None, with_target=True):
     out['pv_corr_21d'] = ret.rolling(21).corr(volume.pct_change())
     out['overnight_gap_21d'] = (open_ / close.shift(1) - 1).rolling(21).mean()
 
-    # Market-relative risk
     if spy_df is not None:
         spy_close = _flatten(spy_df)['Close']
         spy_ret = spy_close.pct_change().reindex(df.index)
@@ -115,32 +110,40 @@ def calculate_features(df, stock_name, spy_df=None, with_target=True):
         out['beta_63'] = 1.0
         out['idio_vol_63'] = out['vol_21d']
 
+    for feat, (ticker, sectors) in SECTOR_SPECIFIC_FEATURES.items():
+        if macro is not None and ticker in macro and sector in sectors:
+            m_ret = _flatten(macro[ticker])['Close'].pct_change().reindex(df.index)
+            out[feat] = ret.rolling(63).cov(m_ret) / m_ret.rolling(63).var()
+        else:
+            out[feat] = np.nan
+
     if with_target:
         fwd = close.shift(-HORIZON_DAYS) / close - 1
         if spy_df is not None:
             spy_close = _flatten(spy_df)['Close']
             spy_fwd = (spy_close.shift(-HORIZON_DAYS) / spy_close - 1).reindex(df.index)
-            fwd = fwd - spy_fwd  # market-excess: strips index-wide noise
+            fwd = fwd - spy_fwd
         out['fwd_excess_return'] = fwd
 
     out['stock'] = stock_name
-    out['sector'] = STOCK_SECTOR.get(stock_name, 'other')
+    out['sector'] = sector
+    for name in SECTORS:
+        out[f'is_{name}'] = float(sector == name)
     out['Date'] = out.index
     return out
 
 
-def build_panel(data, spy_df, with_target=True):
+def build_panel(data, spy_df, with_target=True, macro=None):
     """Stack per-stock feature frames into one panel with sector-relative cols."""
     frames = []
     for stock, df in data.items():
-        f = calculate_features(df, stock, spy_df, with_target=with_target)
+        f = calculate_features(df, stock, spy_df, with_target=with_target,
+                               macro=macro)
         frames.append(f)
     panel = pd.concat(frames, ignore_index=True)
     panel = panel.dropna(subset=BASE_FEATURES +
                          (['fwd_excess_return'] if with_target else []))
 
-    # Sector-relative features: how the stock compares to its own category
-    # today. This is what keeps rankings unbiased across sectors.
     for col in SECTOR_REL_BASE:
         sector_mean = panel.groupby(['Date', 'sector'])[col].transform('mean')
         panel[f'sector_rel_{col}'] = panel[col] - sector_mean
@@ -149,28 +152,57 @@ def build_panel(data, spy_df, with_target=True):
 
 
 def cross_sectional_normalize(panel):
-    """Z-score each feature within each date, clipped at +/-3 sigma."""
-    panel = panel.copy()
-    g = panel.groupby('Date')[FEATURE_COLS]
-    mean, std = g.transform('mean'), g.transform('std')
-    panel[FEATURE_COLS] = ((panel[FEATURE_COLS] - mean) / std.replace(0, np.nan)).clip(-3, 3)
-    return panel.dropna(subset=FEATURE_COLS)
+    """Z-score each feature within each date, clipped at +/-3 sigma.
 
-
-def add_rank_target(panel, sector_neutral=False):
-    """Target = percentile rank (0..1) of market-excess forward return per date.
-
-    With sector_neutral=True the forward return is first demeaned within
-    (date, sector), so the target only rewards beating your own category --
-    the model then cannot express a sector bet at all.
+    Sector flags are left as 0/1. Sector-specific features are z-scored among
+    the stocks they apply to and stay NaN elsewhere (XGBoost handles NaN).
     """
     panel = panel.copy()
-    y = panel['fwd_excess_return']
-    if sector_neutral:
-        y = y - panel.groupby(['Date', 'sector'])['fwd_excess_return'].transform('mean')
-        panel['_neutral_fwd'] = y
-        panel['target'] = panel.groupby('Date')['_neutral_fwd'].rank(pct=True)
-        panel = panel.drop(columns='_neutral_fwd')
+    g = panel.groupby('Date')[NORMALIZED_COLS]
+    mean, std = g.transform('mean'), g.transform('std')
+    panel[NORMALIZED_COLS] = ((panel[NORMALIZED_COLS] - mean) / std.replace(0, np.nan)).clip(-3, 3)
+    required = BASE_FEATURES + SECTOR_REL_FEATURES
+    return panel.dropna(subset=required)
+
+
+def interaction_constraints(mode):
+    """XGBoost interaction_constraints string for FEATURE_COLS, or None.
+
+    mode 'none': unconstrained. mode 'sector': one group per feature holding
+    that feature plus sector flags, so a feature can split by sector but
+    never combine with another feature.
+    """
+    if mode == 'none':
+        return None
+    if mode != 'sector':
+        raise ValueError(f'unknown interaction mode: {mode}')
+    idx = {c: i for i, c in enumerate(FEATURE_COLS)}
+    groups = []
+    for feat in NORMALIZED_COLS:
+        if feat in SECTOR_SPECIFIC_FEATURES:
+            flags = [f'is_{s}' for s in SECTOR_SPECIFIC_FEATURES[feat][1]]
+        else:
+            flags = SECTOR_FLAG_COLS
+        groups.append([idx[feat]] + [idx[f] for f in flags])
+    return json.dumps(groups)
+
+
+def add_rank_target(panel, mode='universe', blend_weight=0.5):
+    """Target = percentile rank (0..1) of the market-excess forward return.
+
+    mode 'universe' ranks against the whole date; 'sector' ranks only within
+    the same (date, sector); 'blend' averages the two.
+    """
+    panel = panel.copy()
+    fwd = panel['fwd_excess_return']
+    universe = fwd.groupby(panel['Date']).rank(pct=True)
+    sector = fwd.groupby([panel['Date'], panel['sector']]).rank(pct=True)
+    if mode == 'universe':
+        panel['target'] = universe
+    elif mode == 'sector':
+        panel['target'] = sector
+    elif mode == 'blend':
+        panel['target'] = blend_weight * universe + (1 - blend_weight) * sector
     else:
-        panel['target'] = panel.groupby('Date')['fwd_excess_return'].rank(pct=True)
+        raise ValueError(f'unknown target mode: {mode}')
     return panel

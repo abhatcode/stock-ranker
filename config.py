@@ -1,9 +1,5 @@
+MODEL_VERSION = 5
 
-MODEL_VERSION = 3
-
-# Universe grouped by sector. Sector labels are used for sector-relative
-# features and the sector-neutral target, which keep the model unbiased
-# across categories of stock.
 SECTORS = {
     'semis_hardware': [
         'NVDA', 'AMD', 'AVGO', 'QCOM', 'MU', 'INTC', 'TXN', 'ADI', 'LRCX',
@@ -52,12 +48,18 @@ STOCK_SECTOR = {s: name for name, sector in SECTORS.items() for s in sector}
 
 BENCHMARK = 'SPY'
 
-# Forward-return horizon in TRADING days (2 calendar weeks).
+SECTOR_SPECIFIC_FEATURES = {
+    'rate_beta_63': ('TLT', ['financials', 'utilities_reits_telecom']),
+    'oil_beta_63': ('USO', ['energy']),
+}
+MACRO_TICKERS = sorted({t for t, _ in SECTOR_SPECIFIC_FEATURES.values()})
+
+# INTERACTION_MODE: 'sector' or 'none'. TARGET_MODE: 'universe', 'sector_rank',
+# 'blend', or 'pairwise_sector'. MODEL_ARCH: 'single' or 'moe'. See README.
+INTERACTION_MODE = 'sector'
+TARGET_MODE = 'pairwise_sector'
+MODEL_ARCH = 'single'
+
 HORIZON_DAYS = 10
-
-# How much history to download for training (calendar days, ~8 years).
 HISTORY_DAYS = 2920
-
-# Purge gap between train/val/test splits, in trading days. Must be >=
-# HORIZON_DAYS so overlapping forward-return windows can't leak across splits.
 PURGE_DAYS = HORIZON_DAYS
